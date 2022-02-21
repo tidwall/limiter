@@ -44,8 +44,8 @@ func main() {
 		func() {
 			l.Begin()
 			defer l.End()
-			// Do some intensive work here. It's guaranteed that only a maximum of ten
-			// of these operations will run at the same time.
+			// Do some intensive work here. It's guaranteed that only a
+			// maximum of ten of these operations will run at the same time.
 			result = []byte("rad!")
 		}()
 
@@ -53,6 +53,41 @@ func main() {
 	})
 
 	http.ListenAndServe(":8080", nil)
+}
+```
+
+## Example using group operations
+
+```go
+package main
+
+import (
+	"github.com/tidwall/limiter"
+)
+
+func main() {
+	// Create a group limiter for a maximum of 10 concurrent operations
+	g := limiter.NewGroup(10)
+
+	for i := 0; i < 100; i++ {
+		err := l.Do(func() error {
+			// Do some intensive work here. It's guaranteed that only a maximum
+			// of ten of these operations will run at the same time. You can 
+			// also return an error if needed which will be picked up by a 
+			// future call to Do() or Wait().
+			return nil
+		})
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// Wait for all 100 background operations to complete. If one or more of
+	// those operations returned an error then that error will be returned here.
+	err := g.Wait()
+	if err != nil {
+		panic(err)
+	}
 }
 ```
 
