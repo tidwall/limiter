@@ -1,8 +1,10 @@
 package limiter
 
-import "sync"
+import (
+	"sync"
+)
 
-// Limiter is for limiting the number of concurrent operations. This
+// Limiter is for limiting the number of concurrent operations.
 type Limiter struct{ sem chan struct{} }
 
 // New returns a new Limiter. The limit param is the maximum number of
@@ -21,48 +23,99 @@ func (l *Limiter) End() {
 	<-l.sem
 }
 
-// Group is for grouping operations together and allows for waiting for
-// all operations to complete.
-type Group struct {
-	mu  sync.Mutex
-	wg  sync.WaitGroup
-	err error
-	l   *Limiter
+type queueItem[I, O any] struct {
+	in   I
+	out  O
+	ok   bool
+	prev *queueItem[I, O]
+	next *queueItem[I, O]
 }
 
-// NewGroup returns a limiter operation group.
-func NewGroup(limit int) *Group {
-	return &Group{l: New(limit)}
+// Queue is a limiter queue operations that executes each operation in
+// background goroutines, where each operation has a single input and output.
+// The inputs are pushed onto the queue using Push, and the output can be
+// retrieved using Pop.
+type Queue[I, O any] struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	l    *Limiter
+	head *queueItem[I, O]
+	tail *queueItem[I, O]
+	op   func(I) O
 }
 
-func (g *Group) Do(op func() error) error {
-	g.wg.Add(1)
+// NewQueue returns a limiter queue.
+func NewQueue[I, O any](limit int, op func(in I) (out O)) *Queue[I, O] {
+	q := &Queue[I, O]{l: New(limit)}
+	q.cond = sync.NewCond(&q.mu)
+	q.op = op
+	q.head = new(queueItem[I, O])
+	q.tail = new(queueItem[I, O])
+	q.head.next = q.tail
+	q.tail.prev = q.head
+	return q
+}
+
+// Push an input onto the queue for background processing.
+func (q *Queue[I, O]) Push(in I) {
+	item := new(queueItem[I, O])
+	item.in = in
+	// push to tail
+	q.mu.Lock()
+	q.tail.prev.next = item
+	item.prev = q.tail.prev
+	item.next = q.tail
+	q.tail.prev = item
+	q.mu.Unlock()
+	// execute operation
 	go func() {
-		g.l.Begin()
+		q.l.Begin()
 		defer func() {
-			g.l.End()
-			g.wg.Done()
+			q.l.End()
+			q.mu.Lock()
+			item.ok = true
+			q.cond.Broadcast()
+			q.mu.Unlock()
 		}()
-		g.mu.Lock()
-		if g.err != nil {
-			g.mu.Unlock()
-			return
-		}
-		g.mu.Unlock()
-		err := op()
-		if err != nil {
-			g.mu.Lock()
-			g.err = err
-			g.mu.Unlock()
-		}
+		item.out = q.op(in)
 	}()
-	return nil
 }
 
-func (g *Group) Wait() error {
-	g.wg.Wait()
-	g.mu.Lock()
-	err := g.err
-	g.mu.Unlock()
-	return err
+func (q *Queue[I, O]) pop() (out O, ok bool) {
+	if q.head.next.ok {
+		item := q.head.next
+		out, ok = item.out, true
+		q.head.next = item.next
+		item.next.prev = item.prev
+	}
+	return out, ok
+}
+
+// Pop output off the queue. The outputs will be returned in order of their
+// respective inputs. Returns false if the queue is empty of if the next input
+// operation has not yet finished processing.
+func (q *Queue[I, O]) Pop() (out O, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.pop()
+}
+
+// PopWait works like Pop but it wait for the next input operation to finish
+// processing before returning its respective output. Returns false if the
+// queue is empty.
+func (q *Queue[I, O]) PopWait() (out O, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for {
+		out, ok = q.pop()
+		if ok {
+			// we have an item
+			return out, ok
+		}
+		if q.head.next == q.tail {
+			// the queue is empty
+			return out, false
+		}
+		q.cond.Wait()
+	}
 }
