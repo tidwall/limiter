@@ -1,8 +1,6 @@
 package limiter
 
-import (
-	"sync"
-)
+import "sync"
 
 // Limiter is for limiting the number of concurrent operations.
 type Limiter struct{ sem chan struct{} }
@@ -117,5 +115,78 @@ func (q *Queue[I, O]) PopWait() (out O, ok bool) {
 			return out, false
 		}
 		q.cond.Wait()
+	}
+}
+
+type result[O any] struct {
+	err error
+	out O
+}
+
+// Group for running background operations.
+type Group[I, O any] struct {
+	wg sync.WaitGroup
+	q  *Queue[I, result[O]]
+}
+
+// NewGroup returns a Group for running background operations.
+func NewGroup[I, O any](limit int, op func(in I) (out O, err error)) *Group[I, O] {
+	g := new(Group[I, O])
+	g.q = NewQueue[I, result[O]](limit, func(in I) result[O] {
+		var res result[O]
+		if op != nil {
+			res.out, res.err = op(in)
+		}
+		return res
+	})
+	return g
+}
+
+// Drain all pending outputs.
+// This acts as a barrier to ensure that there are no more group operations
+// running in the background.
+func (g *Group[I, O]) Drain() {
+	for {
+		_, ok := g.q.PopWait()
+		if !ok {
+			return
+		}
+		g.wg.Done()
+	}
+}
+
+// Send an input to the group for background processing.
+func (g *Group[I, O]) Send(in I) {
+	g.wg.Add(1)
+	g.q.Push(in)
+}
+
+// Recv receives pending outputs. Setting "wait" to true will make this
+// function wait for all inputs to complete being processed before returning.
+// The "results" callback will fire for all outputs in the same order as their
+// respective inputs.
+// If the group operation or callback returned an error then the iterator
+// will stop and that error will be returned to the call of this function.
+func (g *Group[I, O]) Recv(wait bool, results func(out O) error) error {
+	for {
+		var tup result[O]
+		var ok bool
+		if wait {
+			tup, ok = g.q.PopWait()
+		} else {
+			tup, ok = g.q.Pop()
+		}
+		if !ok {
+			return nil
+		}
+		g.wg.Done()
+		if tup.err != nil {
+			return tup.err
+		}
+		if results != nil {
+			if err := results(tup.out); err != nil {
+				return err
+			}
+		}
 	}
 }
